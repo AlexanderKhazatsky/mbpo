@@ -104,12 +104,12 @@ class MBPO(RLAlgorithm):
             num_networks=num_networks, num_elites=num_elites, is_classifier=True)
         
         # MSE Loss
-        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites)
+        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+        #     num_networks=num_networks, num_elites=num_elites)
         
         # Classifier Loss
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites, adversarial_classifier=self._classifier)
+        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+            num_networks=num_networks, num_elites=num_elites, adversarial_classifier=self._classifier)
 
         # Value Func Loss (IP)
         # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
