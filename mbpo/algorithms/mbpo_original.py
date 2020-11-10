@@ -16,8 +16,8 @@ from tensorflow.python.training import training_util
 from softlearning.algorithms.rl_algorithm import RLAlgorithm
 from softlearning.replay_pools.simple_replay_pool import SimpleReplayPool
 
-from mbpo.models.constructor import construct_model, format_samples_for_training, format_samples_for_classifier
-from mbpo.models.fake_env import FakeEnv, FakeAdversarialEnv
+from mbpo.models.constructor import construct_model, format_samples_for_training
+from mbpo.models.fake_env import FakeEnv
 from mbpo.utils.writer import Writer
 from mbpo.utils.visualization import visualize_policy
 from mbpo.utils.logging import Progress
@@ -67,8 +67,6 @@ class MBPO(RLAlgorithm):
             rollout_batch_size=100e3,
             real_ratio=0.1,
             rollout_schedule=[20,100,1,1],
-            classifier_weight_schedule=[0,100,0.05,0.05], # Constant
-            # classifier_weight_schedule=[0,50,0.,0.25], # Linear
             hidden_dim=200,
             max_model_t=None,
             **kwargs,
@@ -99,28 +97,16 @@ class MBPO(RLAlgorithm):
 
         obs_dim = np.prod(training_environment.observation_space.shape)
         act_dim = np.prod(training_environment.action_space.shape)
+        self._model = construct_model(obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim, num_networks=num_networks, num_elites=num_elites)
         self._static_fns = static_fns
-        self._classifier = construct_model(name='classifier', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites, is_classifier=True)
-        
-        # MSE Loss
-        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites)
-        
-        # Classifier Loss
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites, adversarial_classifier=self._classifier)
-
-        # Value Func Loss (IP)
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites, q_func=self)
-        
         self.fake_env = FakeEnv(self._model, self._static_fns)
-        #self.fake_env = FakeAdversarialEnv(self._model, self._classifier, self._static_fns)
 
         self._rollout_schedule = rollout_schedule
-        self._classifier_weight_schedule = classifier_weight_schedule
         self._max_model_t = max_model_t
+
+        # self._model_pool_size = model_pool_size
+        # print('[ MBPO ] Model pool size: {:.2E}'.format(self._model_pool_size))
+        # self._model_pool = SimpleReplayPool(pool._observation_space, pool._action_space, self._model_pool_size)
 
         self._model_retain_epochs = model_retain_epochs
 
@@ -195,7 +181,6 @@ class MBPO(RLAlgorithm):
         policy = self._policy
         pool = self._pool
         model_metrics = {}
-        classifier_metrics = {}
 
         if not self._training_started:
             self._init_training()
@@ -236,27 +221,17 @@ class MBPO(RLAlgorithm):
                         self._epoch, self._model_train_freq, self._timestep, self._total_timestep, self._train_steps_this_epoch, self._num_train_steps)
                     )
 
-                    # Train Model
                     model_train_metrics = self._train_model(batch_size=256, max_epochs=None, holdout_ratio=0.2, max_t=self._max_model_t)
                     model_metrics.update(model_train_metrics)
                     gt.stamp('epoch_train_model')
                     
-                    # Set Scheduled Values
                     self._set_rollout_length()
-                    if isinstance(self.fake_env, FakeAdversarialEnv):
-                        self._set_classifier_weight()
-
-                    # Rollout Model
                     self._reallocate_model_pool()
                     model_rollout_metrics = self._rollout_model(rollout_batch_size=self._rollout_batch_size, deterministic=self._deterministic)
                     model_metrics.update(model_rollout_metrics)
+                    
+
                     gt.stamp('epoch_rollout_model')
-
-                    # Train Classifier
-                    classifier_train_metrics = self._train_classifier(batch_size=256, max_epochs=None, holdout_ratio=0.2, max_t=self._max_model_t)
-                    classifier_metrics.update(classifier_train_metrics)
-                    gt.stamp('epoch_train_classifier')
-
                     # self._visualize_model(self._evaluation_environment, self._total_timestep)
                     self._training_progress.resume()
 
@@ -321,10 +296,6 @@ class MBPO(RLAlgorithm):
                     (f'model/{key}', model_metrics[key])
                     for key in sorted(model_metrics.keys())
                 ),
-                *(
-                    (f'classifier/{key}', classifier_metrics[key])
-                    for key in sorted(classifier_metrics.keys())
-                ),
                 ('epoch', self._epoch),
                 ('timestep', self._timestep),
                 ('timesteps_total', self._total_timestep),
@@ -377,21 +348,6 @@ class MBPO(RLAlgorithm):
             self._epoch, min_epoch, max_epoch, self._rollout_length, min_length, max_length
         ))
 
-    def _set_classifier_weight(self):
-        min_epoch, max_epoch, min_length, max_length = self._classifier_weight_schedule
-        if self._epoch <= min_epoch:
-            y = min_length
-        else:
-            dx = (self._epoch - min_epoch) / (max_epoch - min_epoch)
-            dx = min(dx, 1)
-            y = dx * (max_length - min_length) + min_length
-
-        self._classifier_weight = y
-        self.fake_env.set_classifier_weight(y)
-        print('[ Classifier Weight ] Epoch: {} (min: {}, max: {}) | Weight: {} (min: {} , max: {})'.format(
-            self._epoch, min_epoch, max_epoch, self._classifier_weight, min_length, max_length
-        ))
-
     def _reallocate_model_pool(self):
         obs_space = self._pool._observation_space
         act_space = self._pool._action_space
@@ -422,13 +378,6 @@ class MBPO(RLAlgorithm):
         model_metrics = self._model.train(train_inputs, train_outputs, **kwargs)
         return model_metrics
 
-    def _train_classifier(self, **kwargs):
-        env_samples = self._pool.return_all_samples()
-        model_samples = self._model_pool.return_all_samples()
-        train_inputs, train_outputs = format_samples_for_classifier(env_samples, model_samples, balance=True)
-        classifier_metrics = self._classifier.train(train_inputs, train_outputs, **kwargs)
-        return classifier_metrics
-
     def _rollout_model(self, rollout_batch_size, **kwargs):
         print('[ Model Rollout ] Starting | Epoch: {} | Rollout length: {} | Batch size: {}'.format(
             self._epoch, self._rollout_length, rollout_batch_size
@@ -454,13 +403,6 @@ class MBPO(RLAlgorithm):
 
         mean_rollout_length = sum(steps_added) / rollout_batch_size
         rollout_stats = {'mean_rollout_length': mean_rollout_length}
-        
-        if isinstance(self.fake_env, FakeAdversarialEnv):
-            rollout_stats['classifier_logprob_mean'] = np.mean(info['classifier_logprob'])
-            rollout_stats['classifier_logprob_std'] = np.std(info['classifier_logprob'])
-            rollout_stats['classifier_logprob_min'] = np.min(info['classifier_logprob'])
-            rollout_stats['classifier_logprob_max'] = np.max(info['classifier_logprob'])
-        
         print('[ Model Rollout ] Added: {:.1e} | Model pool: {:.1e} (max {:.1e}) | Length: {} | Train rep: {}'.format(
             sum(steps_added), self._model_pool.size, self._model_pool._max_size, mean_rollout_length, self._n_train_repeat
         ))
@@ -541,12 +483,6 @@ class MBPO(RLAlgorithm):
             name='rewards',
         )
 
-        # self._logprobs_ph = tf.placeholder(
-        #     tf.float32,
-        #     shape=(None, 1),
-        #     name='logprob',
-        # ) #HERE
-
         self._terminals_ph = tf.placeholder(
             tf.float32,
             shape=(None, 1),
@@ -565,19 +501,6 @@ class MBPO(RLAlgorithm):
                 name='raw_actions',
             )
 
-    def _get_Q_value(self, observations):
-        actions = self._policy.actions([observations])
-        log_pis = self._policy.log_pis(
-            [observations], actions)
-
-        Qs_values = tuple(
-            Q([observations, actions])
-            for Q in self._Q_targets)
-
-        min_Q = tf.reduce_min(Qs_values, axis=0)
-        Q_value = min_Q - self._alpha * log_pis
-        return Q_value
-
     def _get_Q_target(self):
         next_actions = self._policy.actions([self._next_observations_ph])
         next_log_pis = self._policy.log_pis(
@@ -589,10 +512,9 @@ class MBPO(RLAlgorithm):
 
         min_next_Q = tf.reduce_min(next_Qs_values, axis=0)
         next_value = min_next_Q - self._alpha * next_log_pis
-        reward = self._reward_scale * self._rewards_ph# + self._classifier_weight * self._logprobs_ph #HERE
 
         Q_target = td_target(
-            reward=reward,
+            reward=self._reward_scale * self._rewards_ph,
             discount=self._discount,
             next_value=(1 - self._terminals_ph) * next_value)
 
@@ -728,26 +650,11 @@ class MBPO(RLAlgorithm):
                 for source, target in zip(source_params, target_params)
             ])
 
-    def evaluate_classifier(self, obs, act, rew, delta):
-        model_trans = np.concatenate((obs, act, rew, delta), axis=-1)
-        prob, _ = self._classifier.predict(model_trans, factored=False)
-        logprob = np.log(prob + self._classifier.eps)
-        return logprob
-
-    def _add_batch_logprob(self, batch):
-        batch['logprobs'] = self.evaluate_classifier(
-            batch['observations'],
-            batch['actions'],
-            batch['rewards'],
-            batch['next_observations'] - batch['observations'],
-        )
-
     def _do_training(self, iteration, batch):
         """Runs the operations for updating training and target ops."""
 
         self._training_progress.update()
         self._training_progress.set_description()
-        #self._add_batch_logprob(batch) #HERE
 
         feed_dict = self._get_feed_dict(iteration, batch)
 
@@ -765,7 +672,6 @@ class MBPO(RLAlgorithm):
             self._actions_ph: batch['actions'],
             self._next_observations_ph: batch['next_observations'],
             self._rewards_ph: batch['rewards'],
-            #self._logprobs_ph: batch['logprobs'], #HERE
             self._terminals_ph: batch['terminals'],
         }
 
