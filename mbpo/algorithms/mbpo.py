@@ -67,8 +67,9 @@ class MBPO(RLAlgorithm):
             rollout_batch_size=100e3,
             real_ratio=0.1,
             rollout_schedule=[20,100,1,1],
-            classifier_weight_schedule=[0,100,0.05,0.05], # Constant
-            # classifier_weight_schedule=[0,50,0.,0.25], # Linear
+            #classifier_weight_schedule=[0,100,0.0, 0.0], # MBPO
+            #classifier_weight_schedule=[0,100,0.25,0.25], # Constant
+            classifier_weight_schedule=[0,25,0.1,1.0], # Linear
             hidden_dim=200,
             max_model_t=None,
             **kwargs,
@@ -99,27 +100,11 @@ class MBPO(RLAlgorithm):
 
         obs_dim = np.prod(training_environment.observation_space.shape)
         act_dim = np.prod(training_environment.action_space.shape)
-        self._static_fns = static_fns
-        self._classifier = construct_model(name='classifier', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites, is_classifier=True)
-        
-        # MSE Loss
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites)
-        
-        # Classifier Loss
-        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites, adversarial_classifier=self._classifier)
-
-        # Value Func Loss (IP)
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites, q_func=self)
-        
-        self.fake_env = FakeEnv(self._model, self._static_fns)
-        #self.fake_env = FakeAdversarialEnv(self._model, self._classifier, self._static_fns)
 
         self._rollout_schedule = rollout_schedule
         self._classifier_weight_schedule = classifier_weight_schedule
+        self._set_rollout_length()
+        self._set_classifier_weight()
         self._max_model_t = max_model_t
 
         self._model_retain_epochs = model_retain_epochs
@@ -163,13 +148,31 @@ class MBPO(RLAlgorithm):
 
         observation_shape = self._training_environment.active_observation_shape
         action_shape = self._training_environment.action_space.shape
-
         assert len(observation_shape) == 1, observation_shape
         self._observation_shape = observation_shape
         assert len(action_shape) == 1, action_shape
         self._action_shape = action_shape
-
         self._build()
+
+        self._static_fns = static_fns
+        
+        self._classifier = construct_model(name='classifier', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+            num_networks=num_networks, num_elites=num_elites, is_classifier=True, session=self._session)
+        
+        # MSE Loss
+        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+            num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, session=self._session)
+        
+        # Classifier Loss
+        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+        #     num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, use_classifier=True, session=self._session)
+
+        # Value Func Loss
+        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+        #     num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, q_func=self.get_Q_value, session=self._session)
+        
+        #self.fake_env = FakeEnv(self._model, self._static_fns)
+        self.fake_env = FakeAdversarialEnv(self._model, self._classifier, self._static_fns)
 
     def _build(self):
         self._training_ops = {}
@@ -240,11 +243,10 @@ class MBPO(RLAlgorithm):
                     model_train_metrics = self._train_model(batch_size=256, max_epochs=None, holdout_ratio=0.2, max_t=self._max_model_t)
                     model_metrics.update(model_train_metrics)
                     gt.stamp('epoch_train_model')
-                    
+
                     # Set Scheduled Values
                     self._set_rollout_length()
-                    if isinstance(self.fake_env, FakeAdversarialEnv):
-                        self._set_classifier_weight()
+                    self._set_classifier_weight()
 
                     # Rollout Model
                     self._reallocate_model_pool()
@@ -387,7 +389,6 @@ class MBPO(RLAlgorithm):
             y = dx * (max_length - min_length) + min_length
 
         self._classifier_weight = y
-        self.fake_env.set_classifier_weight(y)
         print('[ Classifier Weight ] Epoch: {} (min: {}, max: {}) | Weight: {} (min: {} , max: {})'.format(
             self._epoch, min_epoch, max_epoch, self._classifier_weight, min_length, max_length
         ))
@@ -436,10 +437,13 @@ class MBPO(RLAlgorithm):
         batch = self.sampler.random_batch(rollout_batch_size)
         obs = batch['observations']
         steps_added = []
+        logprob_list = []
         for i in range(self._rollout_length):
             act = self._policy.actions_np(obs)
             
             next_obs, rew, term, info = self.fake_env.step(obs, act, **kwargs)
+            
+            logprob_list.append(info['classifier_logprob'])
             steps_added.append(len(obs))
 
             samples = {'observations': obs, 'actions': act, 'next_observations': next_obs, 'rewards': rew, 'terminals': term}
@@ -454,12 +458,13 @@ class MBPO(RLAlgorithm):
 
         mean_rollout_length = sum(steps_added) / rollout_batch_size
         rollout_stats = {'mean_rollout_length': mean_rollout_length}
-        
-        if isinstance(self.fake_env, FakeAdversarialEnv):
-            rollout_stats['classifier_logprob_mean'] = np.mean(info['classifier_logprob'])
-            rollout_stats['classifier_logprob_std'] = np.std(info['classifier_logprob'])
-            rollout_stats['classifier_logprob_min'] = np.min(info['classifier_logprob'])
-            rollout_stats['classifier_logprob_max'] = np.max(info['classifier_logprob'])
+
+        # Classifier Info
+        logprob_array = np.array(logprob_list)
+        rollout_stats['classifier_logprob_mean'] = np.mean(logprob_array)
+        rollout_stats['classifier_logprob_std'] = np.std(logprob_array)
+        rollout_stats['classifier_logprob_min'] = np.min(logprob_array)
+        rollout_stats['classifier_logprob_max'] = np.max(logprob_array)
         
         print('[ Model Rollout ] Added: {:.1e} | Model pool: {:.1e} (max {:.1e}) | Length: {} | Train rep: {}'.format(
             sum(steps_added), self._model_pool.size, self._model_pool._max_size, mean_rollout_length, self._n_train_repeat
@@ -541,11 +546,11 @@ class MBPO(RLAlgorithm):
             name='rewards',
         )
 
-        # self._logprobs_ph = tf.placeholder(
-        #     tf.float32,
-        #     shape=(None, 1),
-        #     name='logprob',
-        # ) #HERE
+        self._logprobs_ph = tf.placeholder(
+            tf.float32,
+            shape=(None, 1),
+            name='logprob',
+        )
 
         self._terminals_ph = tf.placeholder(
             tf.float32,
@@ -565,7 +570,7 @@ class MBPO(RLAlgorithm):
                 name='raw_actions',
             )
 
-    def _get_Q_value(self, observations):
+    def get_Q_value(self, observations):
         actions = self._policy.actions([observations])
         log_pis = self._policy.log_pis(
             [observations], actions)
@@ -589,7 +594,8 @@ class MBPO(RLAlgorithm):
 
         min_next_Q = tf.reduce_min(next_Qs_values, axis=0)
         next_value = min_next_Q - self._alpha * next_log_pis
-        reward = self._reward_scale * self._rewards_ph# + self._classifier_weight * self._logprobs_ph #HERE
+
+        reward = self._reward_scale * self._rewards_ph + self._classifier_weight * self._logprobs_ph
 
         Q_target = td_target(
             reward=reward,
@@ -734,20 +740,11 @@ class MBPO(RLAlgorithm):
         logprob = np.log(prob + self._classifier.eps)
         return logprob
 
-    def _add_batch_logprob(self, batch):
-        batch['logprobs'] = self.evaluate_classifier(
-            batch['observations'],
-            batch['actions'],
-            batch['rewards'],
-            batch['next_observations'] - batch['observations'],
-        )
-
     def _do_training(self, iteration, batch):
         """Runs the operations for updating training and target ops."""
 
         self._training_progress.update()
         self._training_progress.set_description()
-        #self._add_batch_logprob(batch) #HERE
 
         feed_dict = self._get_feed_dict(iteration, batch)
 
@@ -759,13 +756,19 @@ class MBPO(RLAlgorithm):
 
     def _get_feed_dict(self, iteration, batch):
         """Construct TensorFlow feed_dict from sample batch."""
+        logprobs = self.evaluate_classifier(
+            batch['observations'],
+            batch['actions'],
+            batch['rewards'],
+            batch['next_observations'] - batch['observations'],
+        )
 
         feed_dict = {
             self._observations_ph: batch['observations'],
             self._actions_ph: batch['actions'],
             self._next_observations_ph: batch['next_observations'],
             self._rewards_ph: batch['rewards'],
-            #self._logprobs_ph: batch['logprobs'], #HERE
+            self._logprobs_ph: logprobs,
             self._terminals_ph: batch['terminals'],
         }
 
@@ -791,7 +794,6 @@ class MBPO(RLAlgorithm):
 
         Also calls the `draw` method of the plotter, if plotter defined.
         """
-
         feed_dict = self._get_feed_dict(iteration, batch)
 
         (Q_values, Q_losses, alpha, global_step) = self._session.run(

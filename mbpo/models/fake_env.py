@@ -111,19 +111,15 @@ class FakeEnv:
 
 class FakeAdversarialEnv:
 
-    def __init__(self, model, classifier, config, classifier_weight=1.0):
+    def __init__(self, model, classifier, config):
         self.model = model
         self.classifier = classifier
-        self.classifier_weight = classifier_weight
         self.config = config
     '''
         x : [ batch_size, obs_dim + 1 ]
         means : [ num_models, batch_size, obs_dim + 1 ]
         vars : [ num_models, batch_size, obs_dim + 1 ]
     '''
-
-    def set_classifier_weight(self, classifier_weight):
-        self.classifier_weight = classifier_weight
 
     def _get_logprob(self, x, means, variances):
 
@@ -180,7 +176,7 @@ class FakeAdversarialEnv:
 
         log_prob, dev = self._get_logprob(samples, ensemble_model_means, ensemble_model_vars)
         classifier_logprob = self.evaluate_classifier(obs, act, rewards, delta)
-        rewards += (self.classifier_weight * classifier_logprob)
+        #rewards += (self.classifier_weight * classifier_logprob)
         
         terminals = self.config.termination_fn(obs, act, next_obs)
 

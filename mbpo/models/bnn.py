@@ -57,9 +57,15 @@ class BNN:
         self.decays, self.optvars, self.nonoptvars = [], [], []
         self.end_act, self.end_act_name = None, None
         self.scaler = None
+        
+        self.q_func = params['q_func']
+        self.use_q_func = params['q_func'] is not None 
+        
+        self.classifier = params['classifier']
+        self.evaluate_classifier = params['classifier'] is not None
+        self.use_classifier = params['use_classifier']
+        
         self.is_classifier = params['is_classifier']
-        self.adversarial_classifier = params['adversarial_classifier']
-        self.use_classifier = params['adversarial_classifier'] is not None
         self.eps = 1e-8
 
         # Training objects
@@ -196,7 +202,10 @@ class BNN:
             self._loss = self._compile_losses(self.sy_train_in, self.sy_train_targ, inc_var_loss=False)
             
             if self.is_classifier:
-                self.pred_accuracy = self._compile_accuracy(self.sy_train_in, self.sy_train_targ, inc_var_loss=False)
+                self.pred_accuracy = self._compile_accuracy(self.sy_train_in, self.sy_train_targ)
+            if self.evaluate_classifier:
+                nll = self._model_loss_through_classifier(self.sy_train_in, inc_var_loss=False)
+                self.pred_prob = tf.exp(-nll)
 
             self.train_op = self.optimizer.minimize(train_loss, var_list=self.optvars)
 
@@ -241,7 +250,6 @@ class BNN:
         ops = []
         num_layers = len(self.layers)
         for layer in range(num_layers):
-            # net_state = self._state[i]
             params = {key: np.stack([self._state[net][layer][key] for net in range(self.num_nets)]) for key in keys}
             ops.extend(self.layers[layer].set_model_vars(params))
         self.sess.run(ops)
@@ -351,9 +359,6 @@ class BNN:
         else:
             epoch_iter = itertools.count()
 
-        # else:
-        #     epoch_range = trange(epochs, unit="epoch(s)", desc="Network training")
-
         t0 = time.time()
         grad_updates = 0
         for epoch in epoch_iter:
@@ -406,8 +411,6 @@ class BNN:
             if max_t and t > max_t:
                 descr = 'Breaking because of timeout: {}! (max: {})'.format(t, max_t)
                 progress.append_description(descr)
-                # print('Breaking because of timeout: {}! | (max: {})\n'.format(t, max_t))
-                # time.sleep(5)
                 break
 
         progress.stamp()
@@ -416,22 +419,28 @@ class BNN:
         self._set_state()
         if timer: timer.stamp('bnn_set_state')
 
+        holdout_losses = self.sess.run(
+            self._loss,
+            feed_dict={
+                self.sy_train_in: holdout_inputs,
+                self.sy_train_targ: holdout_targets
+            }
+        )
+
         if self.is_classifier:
-            holdout_losses = self.sess.run(
+            holdout_acc = self.sess.run(
                     self.pred_accuracy,
                     feed_dict={
                         self.sy_train_in: holdout_inputs,
                         self.sy_train_targ: holdout_targets
                     }
                 )
-        else:
-            holdout_losses = self.sess.run(
-                self._loss,
-                feed_dict={
-                    self.sy_train_in: holdout_inputs,
-                    self.sy_train_targ: holdout_targets
-                }
-            )
+        if self.evaluate_classifier:
+            holdout_prob = self.sess.run(
+                    self.pred_prob,
+                    feed_dict={self.sy_train_in: holdout_inputs}
+                )
+
 
         if timer: timer.stamp('bnn_holdout')
 
@@ -441,15 +450,14 @@ class BNN:
         val_loss = (np.sort(holdout_losses)[:self.num_elites]).mean()
 
         if self.is_classifier:
-            model_metrics = {'val_acc': val_loss}
+            model_metrics = {'val_acc': holdout_acc.mean(), 'val_loss': val_loss}
+        elif self.evaluate_classifier:
+            model_metrics = {'val_prob': holdout_prob.mean(), 'val_loss': val_loss}
         else:
             model_metrics = {'val_loss': val_loss}
 
         print('[ BNN ] Holdout', np.sort(holdout_losses), model_metrics)
         return OrderedDict(model_metrics)
-        # return np.sort(holdout_losses)[]
-
-        # pdb.set_trace()
 
     def predict(self, inputs, factored=False, *args, **kwargs):
         """Returns the distribution predicted by the model for each input vector in inputs.
@@ -584,9 +592,7 @@ class BNN:
     def _compile_losses(self, inputs, targets, inc_var_loss=True):
         """Helper method for compiling the loss function.
 
-        The loss function is obtained from the log likelihood, assuming that the output
-        distribution is Gaussian, with both mean and (diagonal) covariance matrix being determined
-        by network outputs.
+        The function splits loss functions by the type of BNN being trained.
 
         Arguments:
             inputs: (tf.Tensor) A tensor representing the input batch
@@ -595,12 +601,19 @@ class BNN:
 
         Returns: (tf.Tensor) A tensor representing the loss on the input arguments.
         """
+        # CLASSIFIER LOSS #
         if self.is_classifier:
-            return self._ce_loss(inputs, targets, inc_var_loss=True)
-        elif self.use_classifier:
-            return self._model_loss_through_classifier(inputs)
+            return self._ce_loss(inputs, targets)
+        
+        # MODEL LOSS #
+        if self.use_classifier:
+            loss = self._model_loss_through_classifier(inputs, inc_var_loss)
         else:
-            return self._mse_loss(inputs, targets, inc_var_loss=True)
+            loss = self._mse_loss(inputs, targets, inc_var_loss)
+
+        if self.use_q_func:
+            loss += 0.01 * self._compile_q_value(inputs)
+        return loss
 
     def _mse_loss(self, inputs, targets, inc_var_loss=True):
         """Helper method for compiling the loss function.
@@ -628,78 +641,77 @@ class BNN:
 
         return total_losses
 
-    def _model_loss_through_classifier(self, inputs):
-        """Helper method for compiling the loss function.
-
-        The loss function is obtained from the log likelihood, assuming that the output
-        distribution is Gaussian, with both mean and (diagonal) covariance matrix being determined
-        by network outputs.
-
+    def _model_loss_through_classifier(self, inputs, inc_var_loss=True):
+        """Helper method for compiling the model loss function through the model.
         Arguments:
             inputs: (tf.Tensor) A tensor representing the input batch
-            targets: (tf.Tensor) The desired targets for each input vector in inputs.
-            inc_var_loss: (bool) If True, includes log variance loss.
-
         Returns: (tf.Tensor) A tensor representing the loss on the input arguments.
         """
-
         mean, var = self._compile_outputs(inputs)
         std = tf.math.sqrt(var)
-
         model_pred = mean + tf.random.normal(tf.shape(mean)) * std
-        m_transition = tf.concat([inputs, model_pred], 2)
+        m_trans = tf.concat([inputs, model_pred], 2)
+
+        with tf.variable_scope('classifier'):
+            prob_list = []
+            for i in range(self.num_nets):
+                curr_prob, _ = self.classifier.create_prediction_tensors(m_trans[i])
+                prob_list.append(curr_prob)
+            prob = tf.stack(prob_list)
         
-        with tf.GradientTape(watch_accessed_variables=False) as tape:
-            tape.watch(m_transition)
-            with tf.variable_scope(self.adversarial_classifier.name):
-                ensemble_prob, _ = self.adversarial_classifier._compile_outputs(m_transition)
-
-        logprob = tf.math.log(ensemble_prob + self.eps)
+        logprob = tf.math.log(prob + self.eps)
         logprob = tf.reduce_mean(logprob, axis=(1,2))
+        return -logprob
 
-        # prob = []
+    def _compile_q_value(self, inputs):
+        """Helper method for compiling the q function prediction on the output of the model.
+        Arguments:
+            inputs: (tf.Tensor) A tensor representing the input batch
+        Returns: (tf.Tensor) A tensor representing the q value of the input arguments.
+        """
+        mean, var = self._compile_outputs(inputs)
+        std = tf.math.sqrt(var)
+        model_pred = mean + tf.random.normal(tf.shape(mean)) * std
+        reward, next_state = model_pred[:, :, :1], model_pred[:, :, 1:]
 
-        # for i in range(self.num_nets):
-        #     import pdb; pdb.set_trace()
-        #     predict
-        #     ensemble_prob, _ = self.adversarial_classifier._compile_outputs(m_transition[i])
-        #     curr_prob = tf.reduce_mean(ensemble_prob, axis=0)
-        #     prob.append(curr_prob)
-        # prob = tf.stack(prob)
+        value_list = []
+        for i in range(self.num_nets):
+            curr_val = self.q_func(next_state[i])
+            value_list.append(curr_val)
+        
+        value = tf.stack(value_list)
+        value = tf.reduce_mean(value, axis=(1,2))
 
-        return - logprob
+        return value
 
-    def _ce_loss(self, inputs, targets, inc_var_loss=True):
+    def _ce_loss(self, inputs, targets):
         """Helper method for compiling the loss function.
 
-        The loss function is obtained from the log likelihood, assuming that the output
-        distribution is Gaussian, with both mean and (diagonal) covariance matrix being determined
-        by network outputs.
+        This loss function implements the cross entropy loss.
 
         Arguments:
             inputs: (tf.Tensor) A tensor representing the input batch
             targets: (tf.Tensor) The desired targets for each input vector in inputs.
-            inc_var_loss: (bool) If True, includes log variance loss.
 
         Returns: (tf.Tensor) A tensor representing the loss on the input arguments.
         """
         prob, _ = self._compile_outputs(inputs)
-        ce_loss = - targets * tf.math.log(prob + self.eps)  - (1 - targets) * tf.math.log((1. - prob) + self.eps)
+        ce_loss = - targets * tf.math.log(prob + self.eps)  - (1. - targets) * tf.math.log((1. - prob) + self.eps)
         ce_loss = tf.reduce_mean(ce_loss, axis=(1,2))
 
         return ce_loss
 
-    def _compile_accuracy(self, inputs, targets, inc_var_loss=True):
-        """Helper method for compiling the loss function.
+    #######################
+    # Evaluation methods #
+    #######################
 
-        The loss function is obtained from the log likelihood, assuming that the output
-        distribution is Gaussian, with both mean and (diagonal) covariance matrix being determined
-        by network outputs.
+    def _compile_accuracy(self, inputs, targets):
+        """Helper method for compiling the holdout accuracy.
 
+        The function rounds classifier predictions to get accuracies.
         Arguments:
             inputs: (tf.Tensor) A tensor representing the input batch
             targets: (tf.Tensor) The desired targets for each input vector in inputs.
-            inc_var_loss: (bool) If True, includes log variance loss.
 
         Returns: (tf.Tensor) A tensor representing the loss on the input arguments.
         """
