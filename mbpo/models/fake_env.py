@@ -129,20 +129,20 @@ class FakeAdversarialEnv:
         log_prob = -1/2 * (k * np.log(2*np.pi) + np.log(variances).sum(-1) + (np.power(x-means, 2)/variances).sum(-1))
         
         ## [ batch_size ]
-        prob = np.exp(log_prob).sum(0)
+        #prob = np.exp(log_prob).sum(0)
 
         ## [ batch_size ]
-        log_prob = np.log(prob)
+        log_prob = log_prob.mean(0).reshape(-1, 1)
 
-        stds = np.std(means,0).mean(-1)
+        stds = np.std(means,0).mean(-1).reshape(-1, 1)
 
         return log_prob, stds
 
     def evaluate_classifier(self, obs, act, rew, delta):
         model_trans = np.concatenate((obs, act, rew, delta), axis=-1)
         prob, _ = self.classifier.predict(model_trans, factored=False)
-        logprob = np.log(prob + self.classifier.eps)
-        return logprob
+        p, q = prob + self.classifier.eps, (1 - prob) + self.classifier.eps
+        return p, q
 
     def step(self, obs, act, deterministic=False):
         assert len(obs.shape) == len(act.shape)
@@ -175,8 +175,8 @@ class FakeAdversarialEnv:
         ####
 
         log_prob, dev = self._get_logprob(samples, ensemble_model_means, ensemble_model_vars)
-        classifier_logprob = self.evaluate_classifier(obs, act, rewards, delta)
-        #rewards += (self.classifier_weight * classifier_logprob)
+        p, q = self.evaluate_classifier(obs, act, rewards, delta)
+        kl = np.log(q) - np.log(p)
         
         terminals = self.config.termination_fn(obs, act, next_obs)
 
@@ -191,7 +191,7 @@ class FakeAdversarialEnv:
             rewards = rewards[0]
             terminals = terminals[0]
 
-        info = {'mean': return_means, 'std': return_stds, 'log_prob': log_prob, 'dev': dev, 'classifier_logprob': classifier_logprob}
+        info = {'mean': return_means, 'std': return_stds, 'dev': dev, 'p': p, 'q': p, 'kl': kl}
         return next_obs, rewards, terminals, info
 
     ## for debugging computation graph

@@ -5,7 +5,7 @@ params = {
     'task': 'v2',
 
     'log_dir': '~/ray_mbpo/',
-    'exp_name': 'defaults',
+    'exp_name': 'humanoid_ambpo',
 
     'kwargs': {
         'epoch_length': 1000,
@@ -28,6 +28,7 @@ params = {
         'real_ratio': 0.05,
         'target_entropy': -2,
         'max_model_t': None,
+        'classifier_weight_schedule': [0,50,0.5,5], # Constant #CHANGE EXP NAME
         'rollout_schedule': [20, 300, 1, 25],
         'hidden_dim': 400,
     }

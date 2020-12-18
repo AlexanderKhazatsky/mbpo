@@ -5,7 +5,7 @@ params = {
     'task': 'v2',
 
     'log_dir': '~/ray_mbpo/',
-    'exp_name': 'defaults',
+    'exp_name': 'ambpo_kl',
 
     'kwargs': {
         'epoch_length': 1000,
@@ -29,8 +29,9 @@ params = {
         'target_entropy': -3,
         'max_model_t': None,
         'rollout_schedule': [20, 150, 1, 1],
-        #'classifier_weight_schedule': [0,100,0.0, 0.0], # MBPO
-        #'classifier_weight_schedule': [0,100,0.25,0.25], # Constant
-        'classifier_weight_schedule': [0,25,0.1,1.0], # Linear
+        #'rollout_schedule': [20, 150, 10, 10],
+        'kl_schedule': [0,25,1, 0.1], # MBPO
+        #'kl_schedule': [0,50,1,0], # Constant #CHANGE EXP NAME
+        #'classifier_weight_schedule': [0,25,0.1,1.0], # Linear
     }
 }

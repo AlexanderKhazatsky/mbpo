@@ -66,7 +66,9 @@ class MBPO(RLAlgorithm):
             rollout_batch_size=100e3,
             real_ratio=0.1,
             rollout_schedule=[20,100,1,1],
-            kl_schedule=[0,100,0.0, 0.0],
+            classifier_weight_schedule=[0,100,0.0, 0.0], # MBPO
+            #classifier_weight_schedule=[0,100,0.25,0.25], # Constant
+            #classifier_weight_schedule=[0,25,0.1,1.0], # Linear
             hidden_dim=200,
             max_model_t=None,
             **kwargs,
@@ -99,9 +101,9 @@ class MBPO(RLAlgorithm):
         act_dim = np.prod(training_environment.action_space.shape)
 
         self._rollout_schedule = rollout_schedule
-        self._kl_schedule = kl_schedule
+        self._classifier_weight_schedule = classifier_weight_schedule
         self._set_rollout_length()
-        self._set_dynamics_kl()
+        self._set_classifier_weight()
         self._max_model_t = max_model_t
 
         self._model_retain_epochs = model_retain_epochs
@@ -176,7 +178,6 @@ class MBPO(RLAlgorithm):
 
         self._init_global_step()
         self._init_placeholders()
-        self._init_dynamics_update()
         self._init_actor_update()
         self._init_critic_update()
 
@@ -243,7 +244,7 @@ class MBPO(RLAlgorithm):
 
                     # Set Scheduled Values
                     self._set_rollout_length()
-                    self._set_dynamics_kl()
+                    self._set_classifier_weight()
 
                     # Rollout Model
                     self._reallocate_model_pool()
@@ -376,8 +377,8 @@ class MBPO(RLAlgorithm):
             self._epoch, min_epoch, max_epoch, self._rollout_length, min_length, max_length
         ))
 
-    def _set_dynamics_kl(self):
-        min_epoch, max_epoch, min_length, max_length = self._kl_schedule
+    def _set_classifier_weight(self):
+        min_epoch, max_epoch, min_length, max_length = self._classifier_weight_schedule
         if self._epoch <= min_epoch:
             y = min_length
         else:
@@ -385,9 +386,9 @@ class MBPO(RLAlgorithm):
             dx = min(dx, 1)
             y = dx * (max_length - min_length) + min_length
 
-        self._target_kl = y
-        print('[ Dynamics KL ] Epoch: {} (min: {}, max: {}) | Value: {} (min: {} , max: {})'.format(
-            self._epoch, min_epoch, max_epoch, self._target_kl, min_length, max_length
+        self._classifier_weight = y
+        print('[ Classifier Weight ] Epoch: {} (min: {}, max: {}) | Weight: {} (min: {} , max: {})'.format(
+            self._epoch, min_epoch, max_epoch, self._classifier_weight, min_length, max_length
         ))
 
     def _reallocate_model_pool(self):
@@ -434,13 +435,15 @@ class MBPO(RLAlgorithm):
         batch = self.sampler.random_batch(rollout_batch_size)
         obs = batch['observations']
         steps_added = []
-        kl_list = []
+        classifier_prob_list = []
+        model_prob_list = []
         for i in range(self._rollout_length):
             act = self._policy.actions_np(obs)
             
             next_obs, rew, term, info = self.fake_env.step(obs, act, **kwargs)
             
-            kl_list.append(info['kl'])
+            classifier_prob_list.append(info['classifier_prob'])
+            model_prob_list.append(info['log_prob'])
             steps_added.append(len(obs))
 
             samples = {'observations': obs, 'actions': act, 'next_observations': next_obs, 'rewards': rew, 'terminals': term}
@@ -460,16 +463,28 @@ class MBPO(RLAlgorithm):
             sum(steps_added), self._model_pool.size, self._model_pool._max_size, mean_rollout_length, self._n_train_repeat
         ))
 
-        # KL Info
-        kl_array = np.array(kl_list)
-        rollout_stats['kl_mean'] = np.mean(kl_array)
-        rollout_stats['kl_std'] = np.std(kl_array)
-        rollout_stats['kl_min'] = np.min(kl_array)
-        rollout_stats['kl_max'] = np.max(kl_array)
+        # Model Info
+        model_prob_array = np.array(model_prob_list)
+        rollout_stats['model_prob_mean'] = np.mean(model_prob_array)
+        rollout_stats['model_prob_std'] = np.std(model_prob_array)
+        rollout_stats['model_prob_min'] = np.min(model_prob_array)
+        rollout_stats['model_prob_max'] = np.max(model_prob_array)
         
-        print('[ Model Rollout ] KL Stats | Mean: {0} | Std: {1} | Min: {2} | Max: {3}'.format(
-            np.round(np.mean(kl_array), 4), np.round(np.std(kl_array), 4),
-            np.round(np.min(kl_array), 4), np.round(np.max(kl_array), 4)
+        print('[ Model Rollout ] Model Stats | Mean: {0} | Std: {1} | Min: {2} | Max: {3}'.format(
+            np.round(np.mean(model_prob_array), 4), np.round(np.std(model_prob_array), 4),
+            np.round(np.min(model_prob_array), 4), np.round(np.max(model_prob_array), 4)
+        ))
+
+        # Classifier Info
+        class_prob_array = np.array(classifier_prob_list)
+        rollout_stats['classifier_prob_mean'] = np.mean(class_prob_array)
+        rollout_stats['classifier_prob_std'] = np.std(class_prob_array)
+        rollout_stats['classifier_prob_min'] = np.min(class_prob_array)
+        rollout_stats['classifier_prob_max'] = np.max(class_prob_array)
+        
+        print('[ Model Rollout ] Classifier Stats | Mean: {0} | Std: {1} | Min: {2} | Max: {3}'.format(
+            np.round(np.mean(class_prob_array), 4), np.round(np.std(class_prob_array), 4),
+            np.round(np.min(class_prob_array), 4), np.round(np.max(class_prob_array), 4)
         ))
 
         return rollout_stats
@@ -524,9 +539,6 @@ class MBPO(RLAlgorithm):
         self._iteration_ph = tf.placeholder(
             tf.int64, shape=None, name='iteration')
 
-        self._target_kl_ph = tf.placeholder(
-            tf.float32, shape=None, name='target_kl')
-
         self._observations_ph = tf.placeholder(
             tf.float32,
             shape=(None, *self._observation_shape),
@@ -551,10 +563,10 @@ class MBPO(RLAlgorithm):
             name='rewards',
         )
 
-        self._dynamics_kl_ph = tf.placeholder(
+        self._logprobs_ph = tf.placeholder(
             tf.float32,
             shape=(None, 1),
-            name='dynamics_kl',
+            name='logprob',
         )
 
         self._terminals_ph = tf.placeholder(
@@ -600,8 +612,7 @@ class MBPO(RLAlgorithm):
         min_next_Q = tf.reduce_min(next_Qs_values, axis=0)
         next_value = min_next_Q - self._alpha * next_log_pis
 
-        env_reward = self._reward_scale * self._rewards_ph
-        reward = env_reward - self._dynamics_alpha * self._dynamics_kl_ph
+        reward = self._reward_scale * self._rewards_ph + self._classifier_weight * self._logprobs_ph
 
         Q_target = td_target(
             reward=reward,
@@ -724,34 +735,6 @@ class MBPO(RLAlgorithm):
 
         self._training_ops.update({'policy_train_op': policy_train_op})
 
-    def _init_dynamics_update(self):
-        """Create minimization operations for policy and entropy.
-        Creates a `tf.optimizer.minimize` operations for updating
-        policy and entropy with gradient descent, and adds them to
-        `self._training_ops` attribute.
-        """
-
-        log_dynamics_alpha = self._log_dynamics_alpha = tf.get_variable(
-            'log_dynamics_alpha',
-            dtype=tf.float32,
-            initializer=0.0)
-        
-        dynamics_alpha = tf.exp(log_dynamics_alpha)
-
-        dynamics_alpha_loss = -tf.reduce_mean(
-            log_dynamics_alpha * tf.stop_gradient(self._dynamics_kl_ph - self._target_kl_ph))
-
-        self._dynamics_alpha_optimizer = tf.train.AdamOptimizer(
-            1e-3, name='dynamics_alpha_optimizer')
-        self._dynamics_alpha_train_op = self._dynamics_alpha_optimizer.minimize(
-            loss=dynamics_alpha_loss, var_list=[log_dynamics_alpha])
-
-        self._training_ops.update({
-            'temperature_dynamics_alpha': self._dynamics_alpha_train_op
-        })
-
-        self._dynamics_alpha = dynamics_alpha
-
     def _init_training(self):
         self._update_target(tau=1.0)
 
@@ -767,10 +750,25 @@ class MBPO(RLAlgorithm):
             ])
 
     def evaluate_dynamics_kl(self, obs, act, rew, delta):
+        logp = self.evaluate_classifier(obs, act, rew, delta)
+        logq = self.evaluate_model(obs, act, rew, delta)
+        return logp - logq
+
+    def evaluate_classifier(self, obs, act, rew, delta):
         trans = np.concatenate((obs, act, rew, delta), axis=-1)
         prob, _ = self._classifier.predict(trans, factored=False)
-        p, q = prob + self._classifier.eps, (1 - prob) + self._classifier.eps
-        return np.log(q) - np.log(p)
+        logprob = np.log(prob + self._classifier.eps)
+        return logprob
+
+    def evaluate_model(self, obs, act, rew, delta):
+        model_input = np.concatenate((obs, act), axis=-1)
+        sample = np.concatenate((rew, delta), axis=-1)
+        means, variances = self.model.predict(model_input, factored=True)
+        logprob = -1/2 * (sample.shape[-1] * np.log(2*np.pi) + np.log(variances).sum(-1) + \
+            (np.power(sample-means, 2)/variances).sum(-1))
+        prob = np.exp(logprob).sum(0)
+        logprob = np.log(prob)
+        return logprob
 
     def _do_training(self, iteration, batch):
         """Runs the operations for updating training and target ops."""
@@ -788,7 +786,7 @@ class MBPO(RLAlgorithm):
 
     def _get_feed_dict(self, iteration, batch):
         """Construct TensorFlow feed_dict from sample batch."""
-        dynamics_kl = self.evaluate_dynamics_kl(
+        logprobs = self.evaluate_dynamics_kl(
             batch['observations'],
             batch['actions'],
             batch['rewards'],
@@ -800,8 +798,7 @@ class MBPO(RLAlgorithm):
             self._actions_ph: batch['actions'],
             self._next_observations_ph: batch['next_observations'],
             self._rewards_ph: batch['rewards'],
-            self._target_kl_ph: self._target_kl,
-            self._dynamics_kl_ph: dynamics_kl,
+            self._logprobs_ph: logprobs,
             self._terminals_ph: batch['terminals'],
         }
 
@@ -826,13 +823,11 @@ class MBPO(RLAlgorithm):
         Also calls the `draw` method of the plotter, if plotter defined.
         """
         feed_dict = self._get_feed_dict(iteration, batch)
-        dyna_kl = feed_dict[self._dynamics_kl_ph]
 
-        (Q_values, Q_losses, alpha, dynamics_alpha, global_step) = self._session.run(
+        (Q_values, Q_losses, alpha, global_step) = self._session.run(
             (self._Q_values,
              self._Q_losses,
              self._alpha,
-             self._dynamics_alpha,
              self.global_step),
             feed_dict)
 
@@ -840,10 +835,7 @@ class MBPO(RLAlgorithm):
             'Q-avg': np.mean(Q_values),
             'Q-std': np.std(Q_values),
             'Q_loss': np.mean(Q_losses),
-            'kl-avg': np.mean(dyna_kl),
-            'kl-std': np.std(dyna_kl),
             'alpha': alpha,
-            'dynamics_alpha': dynamics_alpha,
         })
 
         policy_diagnostics = self._policy.get_diagnostics(
@@ -867,10 +859,8 @@ class MBPO(RLAlgorithm):
                 for i, optimizer in enumerate(self._Q_optimizers)
             },
             '_log_alpha': self._log_alpha,
-            '_log_dynamics_alpha': self._log_dynamics_alpha,
         }
 
-        saveables['_dynamics_alpha_optimizer'] = self._dynamics_alpha_optimizer
         if hasattr(self, '_alpha_optimizer'):
             saveables['_alpha_optimizer'] = self._alpha_optimizer
 

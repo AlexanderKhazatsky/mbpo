@@ -53,33 +53,38 @@ def format_samples_for_classifier(env_samples, model_samples, balance=False):
 
 	inputs = np.concatenate((r_inputs, m_inputs), axis=0)
 	outputs = np.concatenate((r_labels, m_labels), axis=0)
-
 	return inputs, outputs
+
+# def split_train_test(data, num_samples, validation_split=0.2):
+# 	num_test = int(num_samples * 0.2)
+# 	train_end = data.shape[0] - num_test
+# 	train_ind = np.random.choice(train_end, size=num_samples - num_test, replace=False)
+# 	data = np.concatenate([data[train_ind], data[-num_test:]], axis=0)
+# 	return data
 
 # def format_samples_for_classifier(env_samples, model_samples, balance=False):
 # 	r_inputs = np.concatenate(format_samples_for_training(env_samples), axis=-1)
 # 	m_inputs = np.concatenate(format_samples_for_training(model_samples), axis=-1)
 
-# 	if balance:
-# 		data_lim = min(r_inputs.shape[0], m_inputs.shape[0])
-# 		r_inputs, m_inputs = r_inputs[:data_lim], m_inputs[:data_lim]
+# 	data_lim = min(r_inputs.shape[0], m_inputs.shape[0])
+# 	r_inputs = split_train_test(r_inputs, data_lim)
+# 	m_inputs = split_train_test(m_inputs, data_lim)
 
 # 	r_labels = np.ones((r_inputs.shape[0], 1))
 # 	m_labels = np.zeros((m_inputs.shape[0], 1))
 
 # 	inputs, outputs = [], []
-# 	for i in range(r_inputs.shape[0] + m_inputs.shape[0]):
-# 		if (i % 2) == 0:
+
+# 	for i in range(r_labels.shape[0] + m_labels.shape[0]):
+# 		if i % 2 == 0:
 # 			inputs.append(r_inputs[i // 2])
 # 			outputs.append(r_labels[i // 2])
 # 		else:
 # 			inputs.append(m_inputs[i // 2])
 # 			outputs.append(m_labels[i // 2])
 
-
 # 	inputs = np.stack(inputs)
 # 	outputs = np.stack(outputs)
-
 # 	return inputs, outputs
 
 def reset_model(model):
