@@ -94,9 +94,27 @@ class MBPO(RLAlgorithm):
         """
 
         super(MBPO, self).__init__(**kwargs)
-
         obs_dim = np.prod(training_environment.observation_space.shape)
         act_dim = np.prod(training_environment.action_space.shape)
+        self._static_fns = static_fns
+
+        self._classifier = construct_model(name='classifier', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+            num_networks=num_networks, num_elites=num_elites, is_classifier=True, session=self._session)
+        
+        # MSE Loss
+        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+            num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, session=self._session)
+        
+        # Classifier Loss
+        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+        #     num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, use_classifier=True, session=self._session)
+
+        # Value Func Loss
+        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
+        #     num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, q_func=self.get_Q_value, session=self._session)
+        
+        #self.fake_env = FakeEnv(self._model, self._static_fns)
+        self.fake_env = FakeAdversarialEnv(self._model, self._classifier, self._static_fns)
 
         self._rollout_schedule = rollout_schedule
         self._kl_schedule = kl_schedule
@@ -151,32 +169,10 @@ class MBPO(RLAlgorithm):
         self._action_shape = action_shape
         self._build()
 
-        self._static_fns = static_fns
-        
-        self._classifier = construct_model(name='classifier', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites, is_classifier=True, session=self._session)
-        
-        # MSE Loss
-        self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-            num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, session=self._session)
-        
-        # Classifier Loss
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, use_classifier=True, session=self._session)
-
-        # Value Func Loss
-        # self._model = construct_model(name='model', obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim,
-        #     num_networks=num_networks, num_elites=num_elites, classifier=self._classifier, q_func=self.get_Q_value, session=self._session)
-        
-        #self.fake_env = FakeEnv(self._model, self._static_fns)
-        self.fake_env = FakeAdversarialEnv(self._model, self._classifier, self._static_fns)
-
     def _build(self):
         self._training_ops = {}
-
         self._init_global_step()
         self._init_placeholders()
-        self._init_dynamics_update()
         self._init_actor_update()
         self._init_critic_update()
 
@@ -420,9 +416,11 @@ class MBPO(RLAlgorithm):
         model_metrics = self._model.train(train_inputs, train_outputs, **kwargs)
         return model_metrics
 
+
     def _train_classifier(self, **kwargs):
         env_samples = self._pool.return_all_samples()
         model_samples = self._model_pool.return_all_samples()
+        # model_samples = self._gather_classifier_data()
         train_inputs, train_outputs = format_samples_for_classifier(env_samples, model_samples, balance=True)
         classifier_metrics = self._classifier.train(train_inputs, train_outputs, **kwargs)
         return classifier_metrics
@@ -473,6 +471,28 @@ class MBPO(RLAlgorithm):
         ))
 
         return rollout_stats
+
+    def _gather_classifier_data(self):
+        # NOTE THIS HAS TO BE FIXED IF ENV != HALFCHEETAH
+        batch = self.sampler.random_batch(self._pool.size // self._rollout_length)
+        obs = batch['observations']
+        all_obs, all_act, all_rew, all_next_obs = [], [], [], []
+
+        for i in range(self._rollout_length):
+            act = self._policy.actions_np(obs)
+            next_obs, rew, term, info = self.fake_env.step(obs, act, deterministic=self._deterministic)
+            nonterm_mask = ~term.squeeze(-1)
+            if nonterm_mask.sum() == 0:
+                print('[ Model Rollout ] Breaking early: {} | {} / {}'.format(i, nonterm_mask.sum(), nonterm_mask.shape))
+                break
+            all_obs.append(obs)
+            all_act.append(act)
+            all_rew.append(rew)
+            all_next_obs.append(next_obs)
+            obs = next_obs[nonterm_mask]
+
+        return {'observations': np.concatenate(all_obs, axis=0), 'actions': np.concatenate(all_act, axis=0), 
+            'rewards': np.concatenate(all_rew, axis=0), 'next_observations': np.concatenate(all_next_obs, axis=0)}
 
     def _visualize_model(self, env, timestep):
         ## save env state
@@ -551,12 +571,6 @@ class MBPO(RLAlgorithm):
             name='rewards',
         )
 
-        self._dynamics_kl_ph = tf.placeholder(
-            tf.float32,
-            shape=(None, 1),
-            name='dynamics_kl',
-        )
-
         self._terminals_ph = tf.placeholder(
             tf.float32,
             shape=(None, 1),
@@ -575,11 +589,43 @@ class MBPO(RLAlgorithm):
                 name='raw_actions',
             )
 
+    # def get_Q_value(self, observations):
+
+    #     # Evaluate policy on s #
+    #     actions = self._policy.actions([observations])
+    #     log_pis = self._policy.log_pis(
+    #         [observations], actions)
+
+    #     # Rollout step #
+    #     next_observations, rewards, terminals, info = self.fake_env.step_ph(observations, actions, **kwargs)
+    #     dynamics_kl = self.fake_env.kl_ph(observations, actions, rewards, next_observations)
+
+    #     # Add constraints to reward #
+    #     constraint_cost = self._alpha * log_pis + self._dynamics_alpha * dynamics_kl
+    #     reward = self._reward_scale * rewards - constraint_cost
+
+
+
+    #     Qs_values = tuple(
+    #         Q([observations, actions])
+    #         for Q in self._Qs)
+
+    #     Q_target = td_target(
+    #         reward=reward,
+    #         discount=self._discount,
+    #         next_value=(1 - terminals) * next_value)
+
+    #     min_Q = tf.reduce_min(Qs_values, axis=0)
+    #     Q_value = min_Q - self._alpha * log_pis
+    #     return Q_value
+
     def get_Q_value(self, observations):
+        # Evaluate policy #
         actions = self._policy.actions([observations])
         log_pis = self._policy.log_pis(
             [observations], actions)
 
+        # Evaluate Q 
         Qs_values = tuple(
             Q([observations, actions])
             for Q in self._Qs)
@@ -589,22 +635,24 @@ class MBPO(RLAlgorithm):
         return Q_value
 
     def _get_Q_target(self):
+        # Evaluate Policy #
         next_actions = self._policy.actions([self._next_observations_ph])
-        next_log_pis = self._policy.log_pis(
-            [self._next_observations_ph], next_actions)
+        next_log_pis = self._policy.log_pis([self._next_observations_ph], next_actions)
 
+        # Evaluate Model #
+        dynamics_kl = self.fake_env.calc_kl(self._next_observations_ph, next_actions, deterministic=self._deterministic)
+
+        # Evaluate Q Function #
         next_Qs_values = tuple(
             Q([self._next_observations_ph, next_actions])
             for Q in self._Q_targets)
-
         min_next_Q = tf.reduce_min(next_Qs_values, axis=0)
-        next_value = min_next_Q - self._alpha * next_log_pis
-
-        env_reward = self._reward_scale * self._rewards_ph
-        reward = env_reward - self._dynamics_alpha * self._dynamics_kl_ph
-
+        constraint_cost = self._alpha * next_log_pis + self._dynamics_alpha * dynamics_kl
+        next_value = min_next_Q - constraint_cost
+        
+        # Calculate Target Value#
         Q_target = td_target(
-            reward=reward,
+            reward=self._reward_scale * self._rewards_ph,
             discount=self._discount,
             next_value=(1 - self._terminals_ph) * next_value)
 
@@ -650,6 +698,7 @@ class MBPO(RLAlgorithm):
 
         self._training_ops.update({'Q': tf.group(Q_training_ops)})
 
+
     def _init_actor_update(self):
         """Create minimization operations for policy and entropy.
         Creates a `tf.optimizer.minimize` operations for updating
@@ -657,11 +706,15 @@ class MBPO(RLAlgorithm):
         `self._training_ops` attribute.
         """
 
+        # Evaluate Policy #
         actions = self._policy.actions([self._observations_ph])
         log_pis = self._policy.log_pis([self._observations_ph], actions)
-
         assert log_pis.shape.as_list() == [None, 1]
 
+        # Evaluate Model #
+        dynamics_kl = self.fake_env.calc_kl(self._observations_ph, actions, deterministic=self._deterministic)
+
+        # Evaluate Entropy Constraint #
         log_alpha = self._log_alpha = tf.get_variable(
             'log_alpha',
             dtype=tf.float32,
@@ -683,6 +736,29 @@ class MBPO(RLAlgorithm):
 
         self._alpha = alpha
 
+        # Evaluate KL Constraint #
+        log_dynamics_alpha = self._log_dynamics_alpha = tf.get_variable(
+            'log_dynamics_alpha',
+            dtype=tf.float32,
+            initializer=0.0)
+        
+        dynamics_alpha = tf.exp(log_dynamics_alpha)
+
+        dynamics_alpha_loss = -tf.reduce_mean(
+            log_dynamics_alpha * tf.stop_gradient(dynamics_kl - self._target_kl_ph))
+
+        self._dynamics_alpha_optimizer = tf.train.AdamOptimizer(
+            self._policy_lr, name='dynamics_alpha_optimizer')
+        self._dynamics_alpha_train_op = self._dynamics_alpha_optimizer.minimize(
+            loss=dynamics_alpha_loss, var_list=[log_dynamics_alpha])
+
+        self._training_ops.update({
+            'temperature_dynamics_alpha': self._dynamics_alpha_train_op
+        })
+
+        self._dynamics_alpha = dynamics_alpha
+
+        # Evaluate Policy Prior #
         if self._action_prior == 'normal':
             policy_prior = tf.contrib.distributions.MultivariateNormalDiag(
                 loc=tf.zeros(self._action_shape),
@@ -691,14 +767,16 @@ class MBPO(RLAlgorithm):
         elif self._action_prior == 'uniform':
             policy_prior_log_probs = 0.0
 
+        # Evaluate Q Function #
         Q_log_targets = tuple(
             Q([self._observations_ph, actions])
             for Q in self._Qs)
         min_Q_log_target = tf.reduce_min(Q_log_targets, axis=0)
+        constraint_cost = alpha * log_pis + dynamics_alpha * dynamics_kl
 
         if self._reparameterize:
             policy_kl_losses = (
-                alpha * log_pis
+                constraint_cost
                 - min_Q_log_target
                 - policy_prior_log_probs)
         else:
@@ -724,34 +802,6 @@ class MBPO(RLAlgorithm):
 
         self._training_ops.update({'policy_train_op': policy_train_op})
 
-    def _init_dynamics_update(self):
-        """Create minimization operations for policy and entropy.
-        Creates a `tf.optimizer.minimize` operations for updating
-        policy and entropy with gradient descent, and adds them to
-        `self._training_ops` attribute.
-        """
-
-        log_dynamics_alpha = self._log_dynamics_alpha = tf.get_variable(
-            'log_dynamics_alpha',
-            dtype=tf.float32,
-            initializer=0.0)
-        
-        dynamics_alpha = tf.exp(log_dynamics_alpha)
-
-        dynamics_alpha_loss = -tf.reduce_mean(
-            log_dynamics_alpha * tf.stop_gradient(self._dynamics_kl_ph - self._target_kl_ph))
-
-        self._dynamics_alpha_optimizer = tf.train.AdamOptimizer(
-            1e-3, name='dynamics_alpha_optimizer')
-        self._dynamics_alpha_train_op = self._dynamics_alpha_optimizer.minimize(
-            loss=dynamics_alpha_loss, var_list=[log_dynamics_alpha])
-
-        self._training_ops.update({
-            'temperature_dynamics_alpha': self._dynamics_alpha_train_op
-        })
-
-        self._dynamics_alpha = dynamics_alpha
-
     def _init_training(self):
         self._update_target(tau=1.0)
 
@@ -765,12 +815,6 @@ class MBPO(RLAlgorithm):
                 tau * source + (1.0 - tau) * target
                 for source, target in zip(source_params, target_params)
             ])
-
-    def evaluate_dynamics_kl(self, obs, act, rew, delta):
-        trans = np.concatenate((obs, act, rew, delta), axis=-1)
-        prob, _ = self._classifier.predict(trans, factored=False)
-        p, q = prob + self._classifier.eps, (1 - prob) + self._classifier.eps
-        return np.log(q) - np.log(p)
 
     def _do_training(self, iteration, batch):
         """Runs the operations for updating training and target ops."""
@@ -788,21 +832,14 @@ class MBPO(RLAlgorithm):
 
     def _get_feed_dict(self, iteration, batch):
         """Construct TensorFlow feed_dict from sample batch."""
-        dynamics_kl = self.evaluate_dynamics_kl(
-            batch['observations'],
-            batch['actions'],
-            batch['rewards'],
-            batch['next_observations'] - batch['observations'],
-        )
 
         feed_dict = {
             self._observations_ph: batch['observations'],
             self._actions_ph: batch['actions'],
             self._next_observations_ph: batch['next_observations'],
             self._rewards_ph: batch['rewards'],
-            self._target_kl_ph: self._target_kl,
-            self._dynamics_kl_ph: dynamics_kl,
             self._terminals_ph: batch['terminals'],
+            self._target_kl_ph: self._target_kl,
         }
 
         if self._store_extra_policy_info:
@@ -826,7 +863,6 @@ class MBPO(RLAlgorithm):
         Also calls the `draw` method of the plotter, if plotter defined.
         """
         feed_dict = self._get_feed_dict(iteration, batch)
-        dyna_kl = feed_dict[self._dynamics_kl_ph]
 
         (Q_values, Q_losses, alpha, dynamics_alpha, global_step) = self._session.run(
             (self._Q_values,
@@ -840,8 +876,6 @@ class MBPO(RLAlgorithm):
             'Q-avg': np.mean(Q_values),
             'Q-std': np.std(Q_values),
             'Q_loss': np.mean(Q_losses),
-            'kl-avg': np.mean(dyna_kl),
-            'kl-std': np.std(dyna_kl),
             'alpha': alpha,
             'dynamics_alpha': dynamics_alpha,
         })
